@@ -12,7 +12,7 @@ import logging
 import numpy as np
 import pandas as pd
 from scipy import signal
-from mne.filter import filter_data
+from mne.filter import filter_data, construct_iir_filter
 from collections import OrderedDict
 from scipy.interpolate import interp1d
 from scipy.fftpack import next_fast_len
@@ -587,10 +587,14 @@ def spindles_detect(
     freq_broad=(1, 30),
     duration=(0.5, 2),
     min_distance=500,
-    thresh={"rel_pow": 0.2, "corr": 0.65, "rms": 1.5},
+    thresh={"rel_pow": 0.2, "corr": 0.65, "rms": 1.5, 'crms': [1.2, 3.5]},
     multi_only=False,
     remove_outliers=False,
     verbose=False,
+    sigma_filter="fir",  # or Butterworth
+    filter_dct={"trans_bw": 1.5, "attenuation": 6},  # or {"trans_bw": 7, "attenuation":24 }
+    win_rms=0.3,  # or 0.75
+    step_rms=0.1  # or 0.375
 ):
     """Spindles detection.
 
@@ -657,13 +661,17 @@ def spindles_detect(
           sigma-filtered signal.
         * ``'rms'``: Number of standard deviations above the mean of a moving
           root mean square of sigma-filtered signal.
+        * ``'crms'``: double threshold for Moving cubed root mean square of 
+          sigmal-filtered signal. when use a list of threshold, that means
+          applying double threshold strategy
+          .. added to version 0.2.1
 
         You can disable one or more threshold by putting ``None`` instead:
 
         .. code-block:: python
 
-            thresh = {'rel_pow': None, 'corr': 0.65, 'rms': 1.5}
-            thresh = {'rel_pow': None, 'corr': None, 'rms': 3}
+            thresh = {'rel_pow': None, 'corr': 0.65, 'rms': 1.5, 'crms': None}
+            thresh = {'rel_pow': None, 'corr': None, 'rms': 3, 'crms': None}
     multi_only : boolean
         Define the behavior of the multi-channel detection. If True, only
         spindles that are present on at least two channels are kept. If False,
@@ -685,6 +693,11 @@ def spindles_detect(
         (or ``verbose=True``) and warning (``verbose=False``).
 
         .. versionadded:: 0.2.0
+    sigma_filter: "fir" or "Butterworth"
+
+        .. added to version 0.2.1
+    filter_dct:
+        .. added to version 0.2.1
 
     Returns
     -------
@@ -780,30 +793,76 @@ def spindles_detect(
         thresh["corr"] = 0.65
     if "rms" not in thresh.keys():
         thresh["rms"] = 1.5
+    if "crms" not in thresh.keys():
+        thresh["crms"] = [1.2, 3.5]
+
     do_rel_pow = thresh["rel_pow"] not in [None, "none", "None"]
     do_corr = thresh["corr"] not in [None, "none", "None"]
     do_rms = thresh["rms"] not in [None, "none", "None"]
-    n_thresh = sum([do_rel_pow, do_corr, do_rms])
+    do_crms = thresh["crms"] not in [None, "none", "None"]
+    n_thresh = sum([do_rel_pow, do_corr, do_rms, do_crms])
     assert n_thresh >= 1, "At least one threshold must be defined."
 
     # Filtering
     nfast = next_fast_len(n_samples)
-    # 1) Broadband bandpass filter (optional -- careful of lower freq for PAC)
-    data_broad = filter_data(data, sf, freq_broad[0], freq_broad[1], method="fir", verbose=0)
+    if do_rel_pow or do_corr:
+        # 1) Broadband bandpass filter (optional -- careful of lower freq for PAC)
+        data_broad = filter_data(data, sf, freq_broad[0], freq_broad[1], method="fir", verbose=0)
     # 2) Sigma bandpass filter
     # The width of the transition band is set to 1.5 Hz on each side,
     # meaning that for freq_sp = (12, 15 Hz), the -6 dB points are located at
     # 11.25 and 15.75 Hz.
-    data_sigma = filter_data(
-        data,
-        sf,
-        freq_sp[0],
-        freq_sp[1],
-        l_trans_bandwidth=1.5,
-        h_trans_bandwidth=1.5,
-        method="fir",
-        verbose=0,
-    )
+    trans_bw = filter_dct["trans_bw"]
+    if sigma_filter == "fir":
+        data_sigma = filter_data(
+            data,
+            sf,
+            freq_sp[0],
+            freq_sp[1],
+            l_trans_bandwidth=trans_bw,
+            h_trans_bandwidth=trans_bw,
+            method="fir",
+            verbose=0,
+        )
+    else:
+        # iir_params=construct_iir_filter(
+        #     iir_params={
+        #         "order": 4,
+        #         "ftype":"butter"},
+        #     f_pass=freq_sp,
+        #     sfreq=sf,
+        #     btype="bandpass",
+        #     )
+        # data_sigma = filter_data(
+        #     data,
+        #     sf,
+        #     freq_sp[0],
+        #     freq_sp[1],
+        #     method="iir",
+        #     iir_params=iir_params,
+        #     verbose=0,
+        # )
+        # Define filter parameters
+        first_stopband = freq_sp[0] - trans_bw  # Hz
+        second_stopband = freq_sp[1] + trans_bw  # Hz
+        stopband_attenuation = filter_dct["attenuation"]  # dB
+
+        # Normalize frequencies to Nyquist frequency (half of the sampling rate)
+        nyq = 0.5 * sf
+        low = freq_sp[0] / nyq
+        high = freq_sp[1] / nyq
+
+        # Butterworth filter design using scipy
+        # N is the order of the filter, and Wn are the critical frequencies
+        N, Wn = signal.buttord([low, high], [first_stopband/nyq, second_stopband/nyq], 1, stopband_attenuation)
+
+        # Create the bandpass Butterworth filter
+        b, a = signal.butter(N, Wn, btype='band')
+
+        # Display frequency response of the filter
+        # w, h = signal.freqz(b, a, fs=sf)
+        data_sigma = signal.filtfilt(b, a, data)
+
 
     # Hilbert power (to define the instantaneous frequency / power)
     analytic = signal.hilbert(data_sigma, N=nfast)[:, :n_samples]
@@ -836,19 +895,20 @@ def spindles_detect(
         # Here we use a step of 200 ms to speed up the computation.
         # Note that even if the threshold is None we still need to calculate it
         # for the individual spindles parameter (RelPow).
-        f, t, Sxx = stft_power(
-            data_broad[i, :], sf, window=2, step=0.2, band=freq_broad, interp=False, norm=True
-        )
-        idx_sigma = np.logical_and(f >= freq_sp[0], f <= freq_sp[1])
-        rel_pow = Sxx[idx_sigma].sum(0)
+        if do_rel_pow:
+            f, t, Sxx = stft_power(
+                data_broad[i, :], sf, window=2, step=0.2, band=freq_broad, interp=False, norm=True
+            )
+            idx_sigma = np.logical_and(f >= freq_sp[0], f <= freq_sp[1])
+            rel_pow = Sxx[idx_sigma].sum(0)
 
-        # Let's interpolate `rel_pow` to get one value per sample
-        # Note that we could also have use the `interp=True` in the
-        # `stft_power` function, however 2D interpolation is much slower than
-        # 1D interpolation.
-        func = interp1d(t, rel_pow, kind="cubic", bounds_error=False, fill_value=0)
-        t = np.arange(n_samples) / sf
-        rel_pow = func(t)
+            # Let's interpolate `rel_pow` to get one value per sample
+            # Note that we could also have use the `interp=True` in the
+            # `stft_power` function, however 2D interpolation is much slower than
+            # 1D interpolation.
+            func = interp1d(t, rel_pow, kind="cubic", bounds_error=False, fill_value=0)
+            t = np.arange(n_samples) / sf
+            rel_pow = func(t)
 
         if do_corr:
             _, mcorr = moving_transform(
@@ -862,7 +922,7 @@ def spindles_detect(
             )
         if do_rms:
             _, mrms = moving_transform(
-                x=data_sigma[i, :], sf=sf, window=0.3, step=0.1, method="rms", interp=True
+                x=data_sigma[i, :], sf=sf, window=win_rms, step=step_rms, method="rms", interp=True
             )
             # Let's define the thresholds
             if hypno is None:
@@ -872,6 +932,20 @@ def spindles_detect(
             # Avoid too high threshold caused by Artefacts / Motion during Wake
             thresh_rms = min(thresh_rms, 10)
             logger.info("Moving RMS threshold = %.3f", thresh_rms)
+        if do_crms:
+            _, mrms = moving_transform(
+                x=data_sigma[i, :], sf=sf, window=win_rms, step=step_rms, method="rms", interp=True
+            )
+            cmrms = mrms**3
+            cmrms_mean = cmrms.mean()
+            # Define threshold
+            # trimmed_std = yasa.trimbothstd(cube_mrms, cut=0.025)
+            # thresh_rms = cube_mrms_mean + 1.5 * trimmed_std
+            thresh_h = thresh["rms"][1]*cmrms_mean
+            thresh_l = thresh["rms"][0]*cmrms_mean
+            thresh_l = min(thresh_l, 10)
+            thresh_h = min(thresh_h, 10)
+            logger.info("Moving CRMS low threshold = %.3f, high threshold = %.3f", thresh_l, thresh_h)
 
         # Boolean vector of supra-threshold indices
         idx_sum = np.zeros(n_samples)
@@ -887,6 +961,19 @@ def spindles_detect(
             idx_mrms = (mrms >= thresh_rms).astype(int)
             idx_sum += idx_mrms
             logger.info("N supra-theshold moving RMS = %i", idx_mrms.sum())
+        if do_crms:
+            where_sp_h = np.where(cmrms > thresh_h)[0]
+            sp = np.split(where_sp_h, np.where(np.diff(where_sp_h) != 1)[0] + 1)
+            idx_peaks = list(map(lambda x: x[0]+np.argmax(cmrms[x]), sp))
+
+            where_sp_l = np.where(cmrms > thresh_l)[0]
+            sp_low = np.split(where_sp_l, np.where(np.diff(where_sp_l) != 1)[0] + 1)
+            spindle_range = [sp_low[i] for i in  range(len(sp_low)) if np.any(np.isin(idx_peaks, sp_low[i]))]
+            where_sp = np.concatenate(spindle_range)
+            idx_crms = np.zeros_like(cmrms)
+            idx_crms[where_sp] = 1
+            idx_sum += idx_crms
+            logger.info("N Detected moving CRMS = %i", idx_mrms.sum())
 
         # Make sure that we do not detect spindles outside mask
         if hypno is not None:
@@ -903,7 +990,8 @@ def spindles_detect(
         # And we then find indices that are strictly greater than 2, i.e. we
         # find the 'true' beginning and 'true' end of the events by finding
         # where at least two out of the three treshold were crossed.
-        where_sp = np.where(idx_sum > (n_thresh - 1))[0]
+        if not do_crms:
+            where_sp = np.where(idx_sum > (n_thresh - 1))[0]
 
         # If no events are found, skip to next channel
         if not len(where_sp):
