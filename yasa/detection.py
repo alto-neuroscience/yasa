@@ -12,11 +12,12 @@ import logging
 import numpy as np
 import pandas as pd
 from scipy import signal
-from mne.filter import filter_data, construct_iir_filter
+from mne.filter import filter_data  #, construct_iir_filter
 from collections import OrderedDict
 from scipy.interpolate import interp1d
 from scipy.fftpack import next_fast_len
 from sklearn.ensemble import IsolationForest
+from scipy.ndimage import gaussian_filter1d
 
 from .spectral import stft_power
 from .numba import _detrend, _rms
@@ -587,14 +588,16 @@ def spindles_detect(
     freq_broad=(1, 30),
     duration=(0.5, 2),
     min_distance=500,
-    thresh={"rel_pow": 0.2, "corr": 0.65, "rms": 1.5, 'crms': [1.2, 3.5]},
+    thresh={"rel_pow": 0.2, "corr": 0.65, "rms": 1.5, 'crms': [1.2, 3.5], "amp": [2.5, 5.5]},
     multi_only=False,
     remove_outliers=False,
     verbose=False,
     sigma_filter="fir",  # or Butterworth
-    filter_dct={"trans_bw": 1.5, "attenuation": 6},  # or {"trans_bw": 7, "attenuation":24 }
+    filter_dct={"trans_bw": 1.5, "attenuation": 6, "order": None},  # or {"trans_bw": 7, "attenuation":24 }
     win_rms=0.3,  # or 0.75
-    step_rms=0.1  # or 0.375
+    step_rms=0.1,  # or 0.375,
+    get_instpow=True,
+    amp_sm_win=0  # s
 ):
     """Spindles detection.
 
@@ -794,40 +797,42 @@ def spindles_detect(
     if "rms" not in thresh.keys():
         thresh["rms"] = 1.5
     if "crms" not in thresh.keys():
-        thresh["crms"] = [1.2, 3.5]
+        thresh["crms"] = None#[1.2, 3.5]
+    if "amp" not in thresh.keys():
+        thresh["amp"] = None
 
     do_rel_pow = thresh["rel_pow"] not in [None, "none", "None"]
     do_corr = thresh["corr"] not in [None, "none", "None"]
     do_rms = thresh["rms"] not in [None, "none", "None"]
     do_crms = thresh["crms"] not in [None, "none", "None"]
-    n_thresh = sum([do_rel_pow, do_corr, do_rms, do_crms])
+    do_amp = thresh["amp"] not in [None, "none", "None"]
+    n_thresh = sum([do_rel_pow, do_corr, do_rms, do_crms, do_amp])
     assert n_thresh >= 1, "At least one threshold must be defined."
 
     # Filtering
-    nfast = next_fast_len(n_samples)
-    if do_rel_pow or do_corr:
-        # 1) Broadband bandpass filter (optional -- careful of lower freq for PAC)
-        data_broad = filter_data(data, sf, freq_broad[0], freq_broad[1], method="fir", verbose=0)
+    # if do_rel_pow or do_corr:
+    # 1) Broadband bandpass filter (optional -- careful of lower freq for PAC)
+    data_broad = filter_data(data, sf, freq_broad[0], freq_broad[1], method="fir", verbose=0)
     # 2) Sigma bandpass filter
     # The width of the transition band is set to 1.5 Hz on each side,
     # meaning that for freq_sp = (12, 15 Hz), the -6 dB points are located at
     # 11.25 and 15.75 Hz.
-    trans_bw = filter_dct["trans_bw"]
+    
     if sigma_filter == "fir":
         data_sigma = filter_data(
             data,
             sf,
             freq_sp[0],
             freq_sp[1],
-            l_trans_bandwidth=trans_bw,
-            h_trans_bandwidth=trans_bw,
+            l_trans_bandwidth=filter_dct["trans_bw"],
+            h_trans_bandwidth=filter_dct["trans_bw"],
             method="fir",
             verbose=0,
         )
-    else:
+    else:  # iir
         # iir_params=construct_iir_filter(
         #     iir_params={
-        #         "order": 4,
+        #         "order": order,
         #         "ftype":"butter"},
         #     f_pass=freq_sp,
         #     sfreq=sf,
@@ -842,10 +847,6 @@ def spindles_detect(
         #     iir_params=iir_params,
         #     verbose=0,
         # )
-        # Define filter parameters
-        first_stopband = freq_sp[0] - trans_bw  # Hz
-        second_stopband = freq_sp[1] + trans_bw  # Hz
-        stopband_attenuation = filter_dct["attenuation"]  # dB
 
         # Normalize frequencies to Nyquist frequency (half of the sampling rate)
         nyq = 0.5 * sf
@@ -854,21 +855,46 @@ def spindles_detect(
 
         # Butterworth filter design using scipy
         # N is the order of the filter, and Wn are the critical frequencies
-        N, Wn = signal.buttord([low, high], [first_stopband/nyq, second_stopband/nyq], 1, stopband_attenuation)
+        auto_order = True
+        if "order" in filter_dct.keys():
+            if filter_dct["order"] is not None:
+                order = filter_dct["order"]
+                Wn = [low, high] # if stopband_attenuation==3
+                auto_order = False
+        if auto_order:
+            # Define filter parameters
+            trans_bw = filter_dct["trans_bw"]
+            first_stopband = freq_sp[0] - trans_bw  # Hz
+            second_stopband = freq_sp[1] + trans_bw  # Hz
+            stopband_attenuation = filter_dct["attenuation"]  # dB
+            order, Wn = signal.buttord([low, high], [first_stopband/nyq, second_stopband/nyq], 1, stopband_attenuation)
 
         # Create the bandpass Butterworth filter
-        b, a = signal.butter(N, Wn, btype='band')
+        b, a = signal.butter(order, Wn, btype='band')
 
         # Display frequency response of the filter
         # w, h = signal.freqz(b, a, fs=sf)
         data_sigma = signal.filtfilt(b, a, data)
+        if np.isnan(data_sigma).any():
+            xsos = signal.butter(order, Wn, btype='band', output="sos")
+            data_sigma = signal.sosfiltfilt(xsos, data)
+
+    if do_amp or get_instpow:
+        nfast = next_fast_len(n_samples)
+        #  Hilbert power (to define the instantaneous frequency / power)
+        analytic = signal.hilbert(data_sigma, N=nfast)[:, :n_samples]
+        inst_phase = np.angle(analytic)
+        inst_amp = np.abs(analytic)
+        if get_instpow:
+            inst_pow = np.square(inst_amp)
+            inst_freq = sf / (2 * np.pi) * np.diff(inst_phase, axis=-1)
+        if amp_sm_win > 0:
+            # Step 3: Smooth the instantaneous amplitude using a Gaussian kernel
+            kernel_size_samples = int(amp_sm_win * sf)  # Convert to number of samples
+            # Apply Gaussian smoothing (sigma is half the kernel size in samples)
+            inst_amp = gaussian_filter1d(inst_amp, sigma=kernel_size_samples / 2)
 
 
-    # Hilbert power (to define the instantaneous frequency / power)
-    analytic = signal.hilbert(data_sigma, N=nfast)[:, :n_samples]
-    inst_phase = np.angle(analytic)
-    inst_pow = np.square(np.abs(analytic))
-    inst_freq = sf / (2 * np.pi) * np.diff(inst_phase, axis=-1)
 
     # Extract the SO signal for coupling
     # if coupling:
@@ -937,15 +963,19 @@ def spindles_detect(
                 x=data_sigma[i, :], sf=sf, window=win_rms, step=step_rms, method="rms", interp=True
             )
             cmrms = mrms**3
-            cmrms_mean = cmrms.mean()
+            cmrms_mean = np.nanmean(cmrms)  # .mean()
             # Define threshold
             # trimmed_std = yasa.trimbothstd(cube_mrms, cut=0.025)
             # thresh_rms = cube_mrms_mean + 1.5 * trimmed_std
-            thresh_h = thresh["rms"][1]*cmrms_mean
-            thresh_l = thresh["rms"][0]*cmrms_mean
-            thresh_l = min(thresh_l, 10)
-            thresh_h = min(thresh_h, 10)
+            thresh_h = thresh["crms"][1]*cmrms_mean
+            thresh_l = thresh["crms"][0]*cmrms_mean
             logger.info("Moving CRMS low threshold = %.3f, high threshold = %.3f", thresh_l, thresh_h)
+        if do_amp:
+            amp_mean = np.nanmean(inst_amp)
+            thresh_h = thresh["amp"][1]*amp_mean
+            thresh_l = thresh["amp"][0]*amp_mean
+            logger.info("Inst Amp low threshold = %.3f, high threshold = %.3f", thresh_l, thresh_h)
+
 
         # Boolean vector of supra-threshold indices
         idx_sum = np.zeros(n_samples)
@@ -973,7 +1003,21 @@ def spindles_detect(
             idx_crms = np.zeros_like(cmrms)
             idx_crms[where_sp] = 1
             idx_sum += idx_crms
-            logger.info("N Detected moving CRMS = %i", idx_mrms.sum())
+            logger.info("N Detected moving CRMS = %i", idx_crms.sum())
+        if do_amp:
+            where_sp_h = np.where(inst_amp > thresh_h)[0]
+            sp = np.split(where_sp_h, np.where(np.diff(where_sp_h) != 1)[0] + 1)
+            idx_peaks = list(map(lambda x: x[0]+np.argmax(inst_amp[x]), sp))
+
+            where_sp_l = np.where(inst_amp > thresh_l)[0]
+            sp_low = np.split(where_sp_l, np.where(np.diff(where_sp_l) != 1)[0] + 1)
+            spindle_range = [sp_low[i] for i in  range(len(sp_low)) if np.any(np.isin(idx_peaks, sp_low[i]))]
+            where_sp = np.concatenate(spindle_range)
+            idx_amp = np.zeros_like(inst_amp)
+            idx_amp[where_sp] = 1
+            idx_sum += idx_amp
+            logger.info("N Detected Inst Amp = %i", idx_amp.sum())
+
 
         # Make sure that we do not detect spindles outside mask
         if hypno is not None:
@@ -1040,13 +1084,14 @@ def spindles_detect(
             # sp_det = signal.detrend(data_broad[i, sp[i]], type='linear')
             sp_amp[j] = np.ptp(sp_det)  # Peak-to-peak amplitude
             sp_rms[j] = _rms(sp_det)  # Root mean square
-            sp_rel[j] = np.median(rel_pow[sp[j]])  # Median relative power
-
-            # Hilbert-based instantaneous properties
-            sp_inst_freq = inst_freq[i, sp[j]]
-            sp_inst_pow = inst_pow[i, sp[j]]
-            sp_abs[j] = np.median(np.log10(sp_inst_pow[sp_inst_pow > 0]))
-            sp_freq[j] = np.median(sp_inst_freq[sp_inst_freq > 0])
+            if do_rel_pow:
+                sp_rel[j] = np.median(rel_pow[sp[j]])  # Median relative power
+            if get_instpow:
+                # Hilbert-based instantaneous properties
+                sp_inst_freq = inst_freq[i, sp[j]]
+                sp_inst_pow = inst_pow[i, sp[j]]
+                sp_abs[j] = np.median(np.log10(sp_inst_pow[sp_inst_pow > 0]))
+                sp_freq[j] = np.median(sp_inst_freq[sp_inst_freq > 0])
 
             # Number of oscillations
             peaks, peaks_params = signal.find_peaks(
@@ -1075,6 +1120,11 @@ def spindles_detect(
                 sp_sta[j] = hypno[sp[j]][0]
 
         # Create a dataframe
+        # if not get_instpow:
+        #     sp_abs = None
+        #     sp_freq = None
+        # if not do_rel_pow:
+        #     sp_rel = None
         sp_params = {
             "Start": sp_start,
             "Peak": sp_pro,
