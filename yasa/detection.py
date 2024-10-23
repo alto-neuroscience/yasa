@@ -696,7 +696,7 @@ def spindles_detect(
         (or ``verbose=True``) and warning (``verbose=False``).
 
         .. versionadded:: 0.2.0
-    sigma_filter: "fir" or "Butterworth"
+    sigma_filter: "fir" or "iir" (butterworth)
 
         .. added to version 0.2.1
     filter_dct:
@@ -797,7 +797,7 @@ def spindles_detect(
     if "rms" not in thresh.keys():
         thresh["rms"] = 1.5
     if "crms" not in thresh.keys():
-        thresh["crms"] = None#[1.2, 3.5]
+        thresh["crms"] = None  # [1.2, 3.5]
     if "amp" not in thresh.keys():
         thresh["amp"] = None
 
@@ -1034,7 +1034,7 @@ def spindles_detect(
         # And we then find indices that are strictly greater than 2, i.e. we
         # find the 'true' beginning and 'true' end of the events by finding
         # where at least two out of the three treshold were crossed.
-        if not do_crms:
+        if not do_crms or not do_amp:
             where_sp = np.where(idx_sum > (n_thresh - 1))[0]
 
         # If no events are found, skip to next channel
